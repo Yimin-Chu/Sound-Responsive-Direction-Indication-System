@@ -1,0 +1,33 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Build folders
+build/
+Debug/
+Release/
+
+# Keil
+*.uvguix.*
+*.uvoptx
+*.dep
+*.bak
+*.lst
+*.map
+*.o
+*.d
+*.crf
+*.lnp
+JLinkLog.txt
+
+# STM32CubeIDE
+.settings/
+.project
+.cproject
+
+# Temporary
+*.tmp
+*.log
