@@ -23,8 +23,9 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "ssd1306.h"
+#include "mic_audio.h"
+#include "oled_ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,10 +58,12 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-#define ADC_BUF_SIZE 1024
-
-uint16_t adc_buf[ADC_BUF_SIZE];   // DMA buffer
-uint16_t adc_volume = 0;          // 音量（简单算法）
+/*
+ * Dual-mode DMA buffer: each uint32_t contains
+ *   [15:0]  = ADC1 result (left  mic, CH10 / PC0)
+ *   [31:16] = ADC2 result (right mic, CH13 / PC3)
+ */
+static uint32_t adc_dual_buf[MIC_BUF_SAMPLES];
 volatile uint8_t adc_ready = 0;
 /* USER CODE END PV */
 
@@ -72,73 +75,14 @@ static void MX_ADC1_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_I2C2_Init(void);
-static void MX_ADC2_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_ADC2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint16_t compute_volume(uint16_t *buf, uint32_t len)
-{
-    // 第一遍：求均值（DC偏置，MAX4466静默时约2048）
-    uint32_t sum = 0;
-    for (uint32_t i = 0; i < len; i++)
-        sum += buf[i];
-    int32_t dc = (int32_t)(sum / len);
-
-    // 第二遍：求去直流后的均方值
-    uint32_t sq_sum = 0;
-    uint16_t peak = 0;
-    for (uint32_t i = 0; i < len; i++)
-    {
-        int32_t ac = (int32_t)buf[i] - dc;
-        // 用绝对值的peak做辅助判断
-        uint16_t abs_ac = (ac >= 0) ? (uint16_t)ac : (uint16_t)(-ac);
-        if (abs_ac > peak) peak = abs_ac;
-
-        sq_sum += (uint32_t)(ac * ac);  // 12bit数据，平方最大 ~16M，1024个累加不会溢出uint32
-    }
-
-    uint16_t rms = (uint16_t)sqrtf((float)sq_sum / len);
-
-    // 可选：放大让串口数值更直观（左移几位或乘系数）
-    // rms = rms << 2;
-
-    return rms;
-}
-
-static void oled_draw_volume(uint16_t volume)
-{
-    char line[32];
-    uint16_t scaled = volume;
-    const uint16_t max_volume = 600U;
-    uint8_t bar_width;
-
-    if (scaled > max_volume)
-    {
-      scaled = max_volume;
-    }
-    bar_width = (uint8_t)((scaled * 120U) / max_volume);
-
-    SSD1306_Fill(SSD1306_COLOR_BLACK);
-    sprintf(line, "MIC VOL:%4u", volume);
-    SSD1306_Puts(line, &Font_11x18);
-
-    /* Draw a simple horizontal bar from y=28..43, x=4..123 */
-    for (uint16_t x = 4; x < 124; x++)
-    {
-      for (uint16_t y = 28; y < 44; y++)
-      {
-        SSD1306_COLOR_t pixel_color = ((x - 4U) < bar_width) ? SSD1306_COLOR_WHITE : SSD1306_COLOR_BLACK;
-        SSD1306_SetPixel(x, y, pixel_color);
-      }
-    }
-
-    SSD1306_UpdateScreen();
-}
-
 
 /* USER CODE END 0 */
 
@@ -176,33 +120,30 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
   MX_I2C2_Init();
-  MX_ADC2_Init();
   MX_TIM2_Init();
+  MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
+
+  /* OLED init */
   SSD1306_Init();
-
-  /*扫描I2C设备*/
-  /*char msg[40];
-  for (uint8_t addr = 0x02; addr < 0xFE; addr += 2)
-  {
-    if (HAL_I2C_IsDeviceReady(&hi2c2, addr, 1, 10) == HAL_OK)
-    {
-        sprintf(msg, "Found: 0x%02X\r\n", addr);
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-    }
-  }
-  sprintf(msg, "Scan done\r\n");
-  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-/*--------------------------------*/
-
   SSD1306_Clear();
-  oled_draw_volume(0);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_SIZE);
+
+  /* Start dual-ADC sampling chain:
+   *   1) ADC2 (slave) -- waits for master trigger
+   *   2) ADC1 (master) -- multi-mode DMA into uint32_t buffer
+   *   3) TIM2 -- periodic TRGO kicks off each conversion pair
+   */
+  HAL_ADC_Start(&hadc2);
+  HAL_ADCEx_MultiModeStart_DMA(&hadc1, adc_dual_buf, MIC_BUF_SAMPLES);
+  HAL_TIM_Base_Start(&htim2);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t last_print = 0;
+  uint32_t     last_print = 0;
+  mic_result_t mic        = {0};
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -212,15 +153,35 @@ int main(void)
     {
         adc_ready = 0;
 
-        adc_volume = compute_volume(adc_buf, ADC_BUF_SIZE);
-        if (HAL_GetTick() - last_print > 100)
+        /* --- Audio processing (future: Audio Task) --------------- */
+        mic_process(adc_dual_buf, MIC_BUF_SAMPLES, &mic);
+
+        /* --- Output at ~10 Hz (future: Display + UART Tasks) ---- */
+        if (HAL_GetTick() - last_print > 500U)
         {
-          last_print = HAL_GetTick();
-          char msg[50];
-          sprintf(msg, "Volume: %u\r\n", adc_volume);
-          HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-          oled_draw_volume(adc_volume);
+            last_print = HAL_GetTick();
+ 
+            /* UART debug output */
+            char msg[64];
+            sprintf(msg, "L:%3u R:%3u D:%+4d %s\r\n",
+                    mic.left_rms, mic.right_rms, mic.diff,
+                    mic_dir_str(mic.direction));
+            HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
+ 
+            /* OLED display */
+            oled_draw_dual(&mic);
         }
+/*if (HAL_GetTick() - last_print > 200U)
+{
+    last_print = HAL_GetTick();
+    char msg[80];
+    uint16_t lo = (uint16_t)(adc_dual_buf[0] & 0xFFFF);
+    uint16_t hi = (uint16_t)(adc_dual_buf[0] >> 16);
+    uint16_t lo1 = (uint16_t)(adc_dual_buf[1] & 0xFFFF);
+    uint16_t hi1 = (uint16_t)(adc_dual_buf[1] >> 16);
+    sprintf(msg, "S0: L=%u R=%u  S1: L=%u R=%u\r\n", lo, hi, lo1, hi1);
+    HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
+}*/
     }
   }
   /* USER CODE END 3 */
@@ -610,12 +571,10 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
-    {
-      adc_ready = 1;
-    }
+        adc_ready = 1;
 }
 /* USER CODE END 4 */
 
@@ -626,7 +585,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -644,8 +602,8 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  (void)file;
+  (void)line;
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
