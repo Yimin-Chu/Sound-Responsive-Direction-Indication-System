@@ -13,7 +13,7 @@
 #define MIC_BUF_SAMPLES   1024U   /* samples per channel per frame  */
 
 /* Direction detection thresholds (tune on real hardware) */
-#define MIC_NOISE_FLOOR     15U   /* RMS below this = silence       */
+#define MIC_NOISE_FLOOR     50U   /* RMS below this = silence       */
 #define MIC_DIR_RATIO_THR   30U   /* |L-R| > threshold → directional*/
 
 /* ── Types ──────────────────────────────────────────────────────── */

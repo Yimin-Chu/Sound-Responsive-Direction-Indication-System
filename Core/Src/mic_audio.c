@@ -77,6 +77,11 @@ void mic_process(const uint32_t *dual_buf, uint32_t len, mic_result_t *out)
     {
         out->direction = MIC_DIR_CENTER;
     }
+    /* Step 4: suppress noise floor for display */
+    /*if (out->left_rms < MIC_NOISE_FLOOR)
+        out->left_rms = 0;
+    if (out->right_rms < MIC_NOISE_FLOOR)
+        out->right_rms = 0;*/
 }
 
 const char *mic_dir_str(mic_direction_t d)
